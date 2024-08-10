@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  BudgetLimit:
+    Description: The alarm limit for the estimated charges (in USD)
+    Type: Number
+Resources:
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal: 
+              Service:
+                - 'events.amazonaws.com'
+            Action: 'sns:Publish'
+            Resource: !GetAtt SNSTopic.TopicArn
+            Condition:
+              StringLike: 
+                'aws:SourceArn':
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+      Topics:
+        - !GetAtt SNSTopic.TopicArn
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+  CloudTrailLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 365
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyName: allow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 'logs:PutLogEvents'
+              - 'logs:CreateLogStream'
+              Resource: !Sub "${CloudTrailLogs.Arn}:*"
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AWSCloudTrailAclCheck20150319'
+            Effect: 'Allow'
+            Principal: 
+              Service:
+                - 'cloudtrail.amazonaws.com'
+            Action: 's3:GetBucketAcl'
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringLike: 
+                'aws:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*"
+          - Sid: AWSCloudTrailWrite20150319
+            Effect: 'Allow'
+            Principal: 
+              Service:
+                - 'cloudtrail.amazonaws.com'
+            Action: 's3:PutObject'
+            Resource: !Sub "${CloudTrailBucket.Arn}/*"
+            Condition:
+              StringLike: 
+                'aws:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*"
+              StringEquals: 
+                s3:x-amz-acl: 'bucket-owner-full-control'
+          - Sid: AWSCloudTrailOrganizationWrite20150319
+            Effect: 'Allow'
+            Principal: 
+              Service:
+                - 'cloudtrail.amazonaws.com'
+            Action: 's3:PutObject'
+            Resource: !Sub "${CloudTrailBucket.Arn}/*"
+            Condition:
+              StringLike: 
+                'aws:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/*"
+              StringEquals: 
+                s3:x-amz-acl: 'bucket-owner-full-control'
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IsOrganizationTrail: true
+      S3BucketName: !Ref CloudTrailBucket
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogs.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+  AccessDeniedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogs
+      FilterPattern: !Sub '{$.recipientAccountId = "${AWS::AccountId}" && $.errorCode = "AccessDenied" && ($.userIdentity.type != "AWSAccount" || $.userIdentity.principalId != "")}'
+      MetricTransformations:
+      - MetricValue: 1
+        MetricNamespace: !Sub "${AWS::StackName}"
+        MetricName: AccessDenieds
+  AccessDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 0
+      Namespace: !Sub "${AWS::StackName}"
+      MetricName: AccessDenieds
+      Statistic: Maximum
+      Period: 60
+      TreatMissingData: notBreaching
+      ActionsEnabled: false
+  AccessDeniedEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      State: ENABLED
+      EventPattern:
+        resources:
+          - !GetAtt AccessDeniedAlarm.Arn
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: 'SNS'
+          Arn: !GetAtt SNSTopic.TopicArn
+          InputTransformer:
+            InputTemplate: !Sub
+              - "\"Access denied. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogsEscaped}/log-events/$3FfilterPattern$3D$257B$2524.recipientAccountId+$253D+$2522757253985935$2522+$2526$2526+$2524.errorCode+$253D+$2522AccessDenied$2522+$2526$2526+$2528$2524.userIdentity.type+$2521$253D+$2522AWSAccount$2522+$257C$257C+$2524.userIdentity.principalId+$2521$253D+$2522$2522$2529$257D\""
+              - CloudTrailLogsEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogs ] ]
+  RootLoginEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      State: ENABLED
+      EventPattern:
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          userIdentity:
+            type:
+              - Root
+      Targets:
+        - Arn: !GetAtt SNSTopic.TopicArn
+          Id: SNS
+          InputTransformer:
+            InputTemplate: !Sub
+              - "\"Root login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogsEscaped}/log-events/$3FfilterPattern$3D$257B$2524.userIdentity.type+$253D+$2522Root$2522$257D\""
+              - CloudTrailLogsEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogs ] ]
+  ConsoleLoginMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogs
+      FilterPattern: !Sub '{$.recipientAccountId = "${AWS::AccountId}" && $.eventName = "ConsoleLogin"}'
+      MetricTransformations:
+      - MetricValue: 1
+        MetricNamespace: !Sub "${AWS::StackName}"
+        MetricName: ConsoleLogins
+  ConsoleLoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 0
+      Namespace: !Sub "${AWS::StackName}"
+      MetricName: ConsoleLogins
+      Statistic: Maximum
+      Period: 60
+      TreatMissingData: notBreaching
+      ActionsEnabled: false
+  ConsoleLoginEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      State: ENABLED
+      EventPattern:
+        resources:
+          - !GetAtt ConsoleLoginAlarm.Arn
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: 'SNS'
+          Arn: !GetAtt SNSTopic.TopicArn
+          InputTransformer:
+            InputTemplate: !Sub
+              - "\"Console login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogsEscaped}/log-events/$3FfilterPattern$3D$257B$2524.recipientAccountId+$253D+$2522757253985935$2522+$2526$2526+$2524.eventName+$253D+$2522ConsoleLogin$2522$257D\""
+              - CloudTrailLogsEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogs ] ]
+  BudgetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: !Ref BudgetLimit
+      Namespace: "AWS/Billing"
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      MetricName: "EstimatedCharges"
+      Statistic: Maximum
+      Period: 21600
+      TreatMissingData: missing
+      ActionsEnabled: false
+  BudgetAlarmEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      State: ENABLED
+      EventPattern:
+        resources:
+          - !GetAtt BudgetAlarm.Arn
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: 'SNS'
+          Arn: !GetAtt SNSTopic.TopicArn
+          InputTransformer:
+            InputTemplate: !Sub "\"Estimated budget more than configured. Check alarm: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:alarm/${BudgetAlarm} \""
+Outputs:
+  SNSTopic:
+    Value: !GetAtt SNSTopic.TopicArn
