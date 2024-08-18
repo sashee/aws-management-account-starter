@@ -13,6 +13,7 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: 'Allow'
+            Sid: current-account
             Principal: 
               Service:
                 - 'events.amazonaws.com'
@@ -22,6 +23,15 @@ Resources:
               StringLike: 
                 'aws:SourceArn':
                   - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+          - Effect: 'Allow'
+            Sid: current-org
+            Principal: 
+              AWS: "*"
+            Action: 'sns:Publish'
+            Resource: !GetAtt SNSTopic.TopicArn
+            Condition:
+              StringEquals: 
+                'aws:PrincipalOrgID': "${aws:ResourceOrgID}"
       Topics:
         - !GetAtt SNSTopic.TopicArn
   CloudTrailBucket:
