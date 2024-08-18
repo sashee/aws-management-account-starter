@@ -240,3 +240,7 @@ Resources:
 Outputs:
   SNSTopic:
     Value: !GetAtt SNSTopic.TopicArn
+  CloudTrailLogGroupArn:
+    Value: !GetAtt CloudTrailLogs.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogGroupArn"
