@@ -5,7 +5,7 @@
 
 ## Contents
 
-* CloudTrail multi-region organization trail to S3 bucket and CloudWatch Logs
+* CloudTrail multi-region organization trail to an S3 bucket
 * Notification for root account login
 * Notification for console sign-in
 * Notification for access denied errors

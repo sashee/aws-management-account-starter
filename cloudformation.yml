@@ -34,33 +34,30 @@ Resources:
                 'aws:PrincipalOrgID': "${aws:ResourceOrgID}"
       Topics:
         - !GetAtt SNSTopic.TopicArn
+  CloudTrailSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt SuspiciousEventsLambdaFunction.Arn
+  CloudTrailSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Sid: current-account
+            Principal: 
+              Service:
+                - 'cloudtrail.amazonaws.com'
+            Action: 'sns:Publish'
+            Resource: !GetAtt CloudTrailSNSTopic.TopicArn
+      Topics:
+        - !GetAtt CloudTrailSNSTopic.TopicArn
   CloudTrailBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
-  CloudTrailLogs:
-    Type: AWS::Logs::LogGroup
-    Properties: 
-      RetentionInDays: 365
-  CloudTrailLogsRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service: cloudtrail.amazonaws.com
-        Version: '2012-10-17'
-      Policies:
-        - PolicyName: allow-logs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-            - Effect: Allow
-              Action:
-              - 'logs:PutLogEvents'
-              - 'logs:CreateLogStream'
-              Resource: !Sub "${CloudTrailLogs.Arn}:*"
   CloudTrailBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -112,26 +109,170 @@ Resources:
       IsMultiRegionTrail: true
       IsOrganizationTrail: true
       S3BucketName: !Ref CloudTrailBucket
-      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogs.Arn
-      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
-  AccessDeniedMetricFilter:
-    Type: AWS::Logs::MetricFilter
+      SnsTopicName: !GetAtt CloudTrailSNSTopic.TopicName
+  SuspiciousEventsLambdaLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 365
+  SuspiciousEventsLambdaExecutionRole:
+    Type: AWS::IAM::Role
     Properties:
-      LogGroupName: !Ref CloudTrailLogs
-      FilterPattern: !Sub '{$.recipientAccountId = "${AWS::AccountId}" && $.errorCode = "AccessDenied" && ($.userIdentity.type != "AWSAccount" || $.userIdentity.principalId != "")}'
-      MetricTransformations:
-      - MetricValue: 1
-        MetricNamespace: !Sub "${AWS::StackName}"
-        MetricName: AccessDenieds
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 'logs:PutLogEvents'
+              - 'logs:CreateLogStream'
+              Resource: !Sub "${SuspiciousEventsLambdaLogGroup.Arn}:*"
+            - Effect: Allow
+              Action:
+                - 'events:PutEvents'
+              Resource: !GetAtt SuspiciousEventsBus.Arn
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Sub "${CloudTrailBucket.Arn}/*"
+  SuspiciousEventsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Role: !GetAtt SuspiciousEventsLambdaExecutionRole.Arn
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          const {S3Client, GetObjectCommand} = require("@aws-sdk/client-s3");
+          const {EventBridgeClient, PutEventsCommand} = require("@aws-sdk/client-eventbridge");
+          const {createGunzip, createBrotliDecompress} = require("node:zlib");
+          const streamConsumers = require("node:stream/consumers");
+
+          exports.handler = async (event) => {
+            const client = new S3Client();
+            const eventBridgeClient = new EventBridgeClient();
+            console.log({event});
+            await event.Records.reduce(async (memo, record) => {
+              await memo;
+              const message = JSON.parse(record.Sns.Message);
+              const {s3Bucket, s3ObjectKey} = message;
+              await s3ObjectKey.reduce(async (memo2, key) => {
+                await memo2;
+                const res = await client.send(new GetObjectCommand({
+                  Bucket: s3Bucket,
+                  Key: key,
+                }));
+                console.log({contentEncoding: res.ContentEncoding});
+                const data = await streamConsumers.json(
+                  res.ContentEncoding === "gzip" ? res.Body.pipe(createGunzip()) : (
+                    res.ContentEncoding === "br" ? res.Body.pipe(createBrotliDecompress()) : res.Body
+                  )
+                );
+                //console.log({data});
+                const suspiciousRecords = data.Records.filter((cloudTrailRecord) => {
+                  return (
+                    cloudTrailRecord.errorCode === "AccessDenied" && (
+                      cloudTrailRecord.userIdentity?.type !== "AWSAccount" || cloudTrailRecord.userIdentity?.principalId
+                    )
+                  ) || (
+                    ["GetCallerIdentity", "ConsoleLogin"].includes(cloudTrailRecord.eventName)
+                  ) || (
+                    cloudTrailRecord.userIdentity?.type === "Root"
+                  );
+                });
+                console.log({suspiciousRecords});
+                if (suspiciousRecords.length > 0) {
+                  suspiciousRecords.forEach((suspiciousRecord) => {
+                    console.log({type: "SUSPICIOUS_RECORD", suspiciousRecord});
+                  });
+                  const groups = Object.values(Object.groupBy(suspiciousRecords, (e, i) => i % Math.ceil(suspiciousRecords / 10)));
+                  await Promise.all(groups.map(async (group) => {
+                    const putEventsResult = await eventBridgeClient.send(new PutEventsCommand({
+                      Entries: group.map((suspiciousRecord) => {
+                        return {
+                          Detail: JSON.stringify(suspiciousRecord),
+                          DetailType: "suspicious-cloudtrail-record",
+                          EventBusName: process.env.EventBus,
+                          Source: "cloudtrail",
+                        };
+                      })
+                    }));
+                    if (putEventsResult.FailedEntryCount > 0) {
+                      throw new Error("Some events failed");
+                    }
+                  }));
+                }
+              }, Promise.resolve());
+            }, Promise.resolve());
+          };
+      LoggingConfig:
+        LogGroup: !Ref SuspiciousEventsLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          EventBus: !GetAtt SuspiciousEventsBus.Arn
+          CloudTrailBucket: !GetAtt CloudTrailBucket.Arn
+  SuspiciousLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref SuspiciousEventsLambdaFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !GetAtt CloudTrailSNSTopic.TopicArn
+  SuspiciousEventsBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub
+        - "suspicious-events-${UniqueId}"
+        - UniqueId: !Select [2, !Split ['/', !Ref AWS::StackId]]
+  AccessDeniedLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 365
+  AccessDeniedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !GetAtt SuspiciousEventsBus.Arn
+      Name: "access-denied-events-rule"
+      EventPattern:
+        source:
+          - "cloudtrail"
+        "detail-type":
+          - "suspicious-cloudtrail-record"
+        detail:
+          errorCode:
+            - "AccessDenied"
+          recipientAccountId:
+            - !Sub "${AWS::AccountId}"
+      Targets: 
+        -
+          Arn: !GetAtt AccessDeniedLogGroup.Arn
+          Id: "access-denied-bus"
   AccessDeniedAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       ComparisonOperator: GreaterThanThreshold
       EvaluationPeriods: 1
       Threshold: 0
-      Namespace: !Sub "${AWS::StackName}"
-      MetricName: AccessDenieds
+      Namespace: "AWS/Events"
+      MetricName: MatchedEvents
       Statistic: Maximum
+      Dimensions:
+        - Name: RuleName
+          Value: "access-denied-events-rule"
+        - Name: EventBusName
+          Value: !Ref SuspiciousEventsBus
       Period: 60
       TreatMissingData: notBreaching
       ActionsEnabled: false
@@ -153,8 +294,8 @@ Resources:
           Arn: !GetAtt SNSTopic.TopicArn
           InputTransformer:
             InputTemplate: !Sub
-              - "\"Access denied. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogsEscaped}/log-events/$3FfilterPattern$3D$257B$2524.recipientAccountId+$253D+$2522757253985935$2522+$2526$2526+$2524.errorCode+$253D+$2522AccessDenied$2522+$2526$2526+$2528$2524.userIdentity.type+$2521$253D+$2522AWSAccount$2522+$257C$257C+$2524.userIdentity.principalId+$2521$253D+$2522$2522$2529$257D\""
-              - CloudTrailLogsEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogs ] ]
+              - "\"Access denied. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${AccessDeniedLogGroupEscaped}/log-events\""
+              - AccessDeniedLogGroupEscaped: !Join [ '$252F', !Split [ '/', !Ref AccessDeniedLogGroup ] ]
   RootLoginEventRule:
     Type: "AWS::Events::Rule"
     Properties:
@@ -171,26 +312,45 @@ Resources:
           Id: SNS
           InputTransformer:
             InputTemplate: !Sub
-              - "\"Root login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogsEscaped}/log-events/$3FfilterPattern$3D$257B$2524.userIdentity.type+$253D+$2522Root$2522$257D\""
-              - CloudTrailLogsEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogs ] ]
-  ConsoleLoginMetricFilter:
-    Type: AWS::Logs::MetricFilter
+              - "\"Root login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${SuspiciousEventsLambdaLogGroupEscaped}/log-events\""
+              - SuspiciousEventsLambdaLogGroupEscaped: !Join [ '$252F', !Split [ '/', !Ref SuspiciousEventsLambdaLogGroup ] ]
+  ConsoleLoginLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 365
+  ConsoleLoginRule:
+    Type: AWS::Events::Rule
     Properties:
-      LogGroupName: !Ref CloudTrailLogs
-      FilterPattern: !Sub '{$.recipientAccountId = "${AWS::AccountId}" && $.eventName = "ConsoleLogin"}'
-      MetricTransformations:
-      - MetricValue: 1
-        MetricNamespace: !Sub "${AWS::StackName}"
-        MetricName: ConsoleLogins
+      EventBusName: !GetAtt SuspiciousEventsBus.Arn
+      Name: "console-login-events-rule"
+      EventPattern:
+        source:
+          - "cloudtrail"
+        "detail-type":
+          - "suspicious-cloudtrail-record"
+        detail:
+          eventName:
+            - "ConsoleLogin"
+          recipientAccountId:
+            - !Sub "${AWS::AccountId}"
+      Targets: 
+        -
+          Arn: !GetAtt ConsoleLoginLogGroup.Arn
+          Id: "access-denied-bus"
   ConsoleLoginAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       ComparisonOperator: GreaterThanThreshold
       EvaluationPeriods: 1
       Threshold: 0
-      Namespace: !Sub "${AWS::StackName}"
-      MetricName: ConsoleLogins
+      Namespace: "AWS/Events"
+      MetricName: MatchedEvents
       Statistic: Maximum
+      Dimensions:
+        - Name: RuleName
+          Value: "console-login-events-rule"
+        - Name: EventBusName
+          Value: !Ref SuspiciousEventsBus
       Period: 60
       TreatMissingData: notBreaching
       ActionsEnabled: false
@@ -212,8 +372,8 @@ Resources:
           Arn: !GetAtt SNSTopic.TopicArn
           InputTransformer:
             InputTemplate: !Sub
-              - "\"Console login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogsEscaped}/log-events/$3FfilterPattern$3D$257B$2524.recipientAccountId+$253D+$2522757253985935$2522+$2526$2526+$2524.eventName+$253D+$2522ConsoleLogin$2522$257D\""
-              - CloudTrailLogsEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogs ] ]
+              - "\"Console login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${ConsoleLoginLogGroupEscaped}/log-events/$3FfilterPattern$3D$257B$2524.recipientAccountId+$253D+$2522757253985935$2522+$2526$2526+$2524.eventName+$253D+$2522ConsoleLogin$2522$257D\""
+              - ConsoleLoginLogGroupEscaped: !Join [ '$252F', !Split [ '/', !Ref ConsoleLoginLogGroup ] ]
   BudgetAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -247,10 +407,38 @@ Resources:
           Arn: !GetAtt SNSTopic.TopicArn
           InputTransformer:
             InputTemplate: !Sub "\"Estimated budget more than configured. Check alarm: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:alarm/${BudgetAlarm} \""
+  LogGroupForEventsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: EventBridgeToCWLogsPolicy
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EventBridgetoCWLogsPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "delivery.logs.amazonaws.com",
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                "${AccessDeniedLogGroup.Arn}",
+                "${ConsoleLoginLogGroup.Arn}"
+              ]
+            }
+          ]
+        }
 Outputs:
   SNSTopic:
     Value: !GetAtt SNSTopic.TopicArn
-  CloudTrailLogGroupArn:
-    Value: !GetAtt CloudTrailLogs.Arn
+  SuspiciousEventsBus:
+    Value: !GetAtt SuspiciousEventsBus.Arn
     Export:
-      Name: !Sub "${AWS::StackName}-CloudWatchLogGroupArn"
+      Name: !Sub "${AWS::StackName}-SuspiciousEventsBus"
