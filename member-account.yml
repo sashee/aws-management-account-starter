@@ -1,0 +1,26 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: "The account ID of the management account"
+Resources:
+  SuspiciousEventsBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub
+        - "suspicious-events-${UniqueId}"
+        - UniqueId: !Select [2, !Split ['/', !Ref AWS::StackId]]
+  AllowManagementAccountToPushEvents: 
+    Type: AWS::Events::EventBusPolicy
+    Properties: 
+      EventBusName: !Ref SuspiciousEventsBus
+      StatementId: "MgmtAccountPush"
+      Statement:
+        Effect: "Allow"
+        Principal:
+          AWS: !Ref ManagementAccountId
+        Action: "events:PutEvents"
+        Resource: !GetAtt SuspiciousEventsBus.Arn
+Outputs:
+  SuspiciousEventsBus:
+    Value: !GetAtt SuspiciousEventsBus.Arn

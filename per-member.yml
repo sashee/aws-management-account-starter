@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  MemberSuspiciousEventBusArn:
+    Description: The ARN of the event bus in the member account where the suspicious events are sent
+    Type: String
+  ManagementStackName:
+    Type: String
+    Description: "The name of the deployed starter stack"
+Resources:
+  EventsForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - events.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'events:PutEvents'
+              Resource: !Ref MemberSuspiciousEventBusArn
+  MemberForwarderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName:
+        Fn::ImportValue: !Sub "${ManagementStackName}-SuspiciousEventsBus"
+      Name: !Sub
+        - "forward-events-to-${AccountId}"
+        - AccountId: !Select [4, !Split [':', !Ref MemberSuspiciousEventBusArn]]
+      EventPattern:
+        source:
+          - "cloudtrail"
+        "detail-type":
+          - "suspicious-cloudtrail-record"
+        detail:
+          recipientAccountId:
+            - !Select [4, !Split [':', !Ref MemberSuspiciousEventBusArn]]
+      Targets: 
+        -
+          Arn: !Ref MemberSuspiciousEventBusArn
+          Id: "forward-to-member"
+          RoleArn: !GetAtt EventsForwarderRole.Arn

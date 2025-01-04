@@ -152,6 +152,7 @@ Resources:
       Handler: index.handler
       Timeout: 30
       MemorySize: 256
+      ReservedConcurrentExecutions: 1
       Code:
         ZipFile: |
           const {S3Client, GetObjectCommand} = require("@aws-sdk/client-s3");
@@ -179,7 +180,6 @@ Resources:
                     res.ContentEncoding === "br" ? res.Body.pipe(createBrotliDecompress()) : res.Body
                   )
                 );
-                //console.log({data});
                 const suspiciousRecords = data.Records.filter((cloudTrailRecord) => {
                   return (
                     cloudTrailRecord.errorCode === "AccessDenied" && (
@@ -191,7 +191,6 @@ Resources:
                     cloudTrailRecord.userIdentity?.type === "Root"
                   );
                 });
-                console.log({suspiciousRecords});
                 if (suspiciousRecords.length > 0) {
                   suspiciousRecords.forEach((suspiciousRecord) => {
                     console.log({type: "SUSPICIOUS_RECORD", suspiciousRecord});
@@ -372,7 +371,7 @@ Resources:
           Arn: !GetAtt SNSTopic.TopicArn
           InputTransformer:
             InputTemplate: !Sub
-              - "\"Console login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${ConsoleLoginLogGroupEscaped}/log-events/$3FfilterPattern$3D$257B$2524.recipientAccountId+$253D+$2522757253985935$2522+$2526$2526+$2524.eventName+$253D+$2522ConsoleLogin$2522$257D\""
+              - "\"Console login detected. Check logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${ConsoleLoginLogGroupEscaped}/log-events\""
               - ConsoleLoginLogGroupEscaped: !Join [ '$252F', !Split [ '/', !Ref ConsoleLoginLogGroup ] ]
   BudgetAlarm:
     Type: AWS::CloudWatch::Alarm
