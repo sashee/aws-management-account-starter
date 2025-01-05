@@ -24,3 +24,5 @@ Resources:
 Outputs:
   SuspiciousEventsBus:
     Value: !GetAtt SuspiciousEventsBus.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SuspiciousEventsBus"
