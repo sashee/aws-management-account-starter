@@ -1,7 +1,12 @@
 ## Prerequisites
 
 * Turn on budget alarms: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/monitor_estimated_charges_with_cloudwatch.html#turning_on_billing_metrics
+* Enable Organizations
 * Deploy to the us-east-1 region
+
+## Inputs
+
+* BudgetLimit: Alarm limit for forecasted costs
 
 ## Contents
 
