@@ -184,6 +184,8 @@ Resources:
                   return (
                     cloudTrailRecord.errorCode === "AccessDenied" && (
                       cloudTrailRecord.userIdentity?.type !== "AWSAccount" || cloudTrailRecord.userIdentity?.principalId
+                    ) && (
+                      cloudTrailRecord.userIdentity?.invokedBy !== "config.amazonaws.com"
                     )
                   ) || (
                     ["GetCallerIdentity", "ConsoleLogin"].includes(cloudTrailRecord.eventName)
